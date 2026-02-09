@@ -1,5 +1,4 @@
 <?php
-//TODO: currentregister/target registrar variables to LOG output. Make it a bit universal //
 use WHMCS\Database\Capsule;
 
 add_hook('PreRegistrarRenewDomain', 1, function(array $vars) {
@@ -41,23 +40,26 @@ add_hook('PreRegistrarRenewDomain', 1, function(array $vars) {
 
     $currentRegistrar = strtolower(trim((string)($row->registrar ?? '')));
 
-    $logBoth = function(string $msg) use ($domain, $domainId, $currentRegistrar) {
-        logActivity("[CNIC→OPENPROVIDER] {$domain} (ID {$domainId}, registrar={$currentRegistrar}) - {$msg}");
+    // Dynamic log prefix using the configured registrars
+    $logPrefix = strtoupper($triggerOnlyIfCurrentRegistrar) . '→' . strtoupper($targetRegistrar);
+
+    $logBoth = function(string $msg) use ($domain, $domainId, $currentRegistrar, $logPrefix) {
+        logActivity("[{$logPrefix}] {$domain} (ID {$domainId}, registrar={$currentRegistrar}) - {$msg}");
     };
 
     // Helper to add admin notes to the domain
-    $addAdminNote = function(string $note) use ($domainId) {
+    $addAdminNote = function(string $note) use ($domainId, $logPrefix) {
         try {
             $existing = Capsule::table('tbldomains')->where('id', $domainId)->value('additionalnotes') ?? '';
             $timestamp = date('Y-m-d H:i:s');
-            $newNote = "[{$timestamp}] {$note}";
+            $newNote = "[{$timestamp}] [{$logPrefix}] {$note}";
             $updated = trim($existing . "\n" . $newNote);
 
             Capsule::table('tbldomains')
                 ->where('id', $domainId)
                 ->update(['additionalnotes' => $updated]);
         } catch (\Throwable $e) {
-            logActivity("[CNIC→OPENPROVIDER] Failed to add admin note: " . $e->getMessage());
+            logActivity("[{$logPrefix}] Failed to add admin note: " . $e->getMessage());
         }
     };
 
@@ -187,8 +189,8 @@ add_hook('PreRegistrarRenewDomain', 1, function(array $vars) {
             return [
                 'abortWithError' =>
                     $eppCode === ''
-                    ? "Renewal replaced by transfer to Openprovider. EPP requested but not returned (check email). Domain set to Pending Transfer."
-                    : "Renewal replaced by Openprovider transfer (submitted). Domain set to Pending Transfer; dates will update via Domain Sync.",
+                    ? "Renewal replaced by transfer to " . ucfirst($targetRegistrar) . ". EPP requested but not returned (check email). Domain set to Pending Transfer."
+                    : "Renewal replaced by " . ucfirst($targetRegistrar) . " transfer (submitted). Domain set to Pending Transfer; dates will update via Domain Sync.",
             ];
         }
 
@@ -196,8 +198,7 @@ add_hook('PreRegistrarRenewDomain', 1, function(array $vars) {
         $logBoth("FAILED: " . $e->getMessage());
         $addAdminNote("Migration FAILED: " . $e->getMessage());
         return [
-            'abortWithError' => "CNIC→Openprovider migration failed: " . $e->getMessage(),
+            'abortWithError' => "{$logPrefix} migration failed: " . $e->getMessage(),
         ];
     }
 });
-
