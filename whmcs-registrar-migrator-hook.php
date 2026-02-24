@@ -1,59 +1,72 @@
 <?php
 use WHMCS\Database\Capsule;
 
-add_hook('PreRegistrarRenewDomain', 1, function(array $vars) {
+/**
+ * Replace renewal with a transfer (CNIC -> OpenProvider) on paid renewal attempt.
+ * WHMCS 8.13.1
+ */
+add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
 
     // ---------------- CONFIG ----------------
     $adminUsername = 'chris';
 
     // Only trigger if current domain registrar matches this (case-insensitive).
-    $triggerOnlyIfCurrentRegistrar = 'cnic'; //The old provider//
+    $triggerOnlyIfCurrentRegistrar = 'cnic'; // old provider
 
     // Target registrar module slug
-    $targetRegistrar = 'openprovider'; //The new provider//
+    $targetRegistrar = 'openprovider'; // new provider
 
     // Safety: only run for these domains (lowercase). Keep empty [] to allow all.
     $allowlistDomains = [
-        'myipnetworks.com',  // a test domain to dryrun. Leave empty for all, or create a list of domains needed to migrate
-        // Add your test domain here
+        'myipnetworks.com', // test domain
+        // add more, or leave empty for all
     ];
 
     // Optional: never run for these domains (lowercase)
     $blocklistDomains = [];
 
-    // Dry run mode: unlock/disable ID/get EPP, but DON'T transfer or change registrar
-    $dryRun = true;  // SET TO false WHEN READY FOR PRODUCTION
+    // Dry run mode: still does unlock/idprotect/epp, but DOES NOT change registrar or submit transfer.
+    $dryRun = true; // SET TO false WHEN READY
 
     // Best-effort steps
     $unlockDomain     = true;
     $disableIdProtect = true;
+
+    // When switching to transfer mode, also set donotrenew=1 to avoid renewal re-queue.
+    $setDoNotRenewDuringTransfer = true;
+
+    // If EPP is empty, do you still want to flip status/registrar?
+    // Recommended: false (only mark pending when you can submit transfer).
+    $markPendingWithoutEpp = false;
     // ----------------------------------------
 
     $params   = $vars['params'] ?? [];
     $domainId = (int)($params['domainid'] ?? 0);
     $domain   = strtolower(trim((string)($params['domain'] ?? '')));
 
-    if (!$domainId || $domain === '') return;
+    if (!$domainId || $domain === '') {
+        return;
+    }
 
     $row = Capsule::table('tbldomains')->where('id', $domainId)->first();
-    if (!$row) return;
+    if (!$row) {
+        return;
+    }
 
     $currentRegistrar = strtolower(trim((string)($row->registrar ?? '')));
 
-    // Dynamic log prefix using the configured registrars
     $logPrefix = strtoupper($triggerOnlyIfCurrentRegistrar) . '→' . strtoupper($targetRegistrar);
 
-    $logBoth = function(string $msg) use ($domain, $domainId, $currentRegistrar, $logPrefix) {
+    $logBoth = function (string $msg) use ($domain, $domainId, $currentRegistrar, $logPrefix) {
         logActivity("[{$logPrefix}] {$domain} (ID {$domainId}, registrar={$currentRegistrar}) - {$msg}");
     };
 
-    // Helper to add admin notes to the domain
-    $addAdminNote = function(string $note) use ($domainId, $logPrefix) {
+    $addAdminNote = function (string $note) use ($domainId, $logPrefix) {
         try {
-            $existing = Capsule::table('tbldomains')->where('id', $domainId)->value('additionalnotes') ?? '';
+            $existing  = Capsule::table('tbldomains')->where('id', $domainId)->value('additionalnotes') ?? '';
             $timestamp = date('Y-m-d H:i:s');
-            $newNote = "[{$timestamp}] [{$logPrefix}] {$note}";
-            $updated = trim($existing . "\n" . $newNote);
+            $newNote   = "[{$timestamp}] [{$logPrefix}] {$note}";
+            $updated   = trim($existing . "\n" . $newNote);
 
             Capsule::table('tbldomains')
                 ->where('id', $domainId)
@@ -82,7 +95,7 @@ add_hook('PreRegistrarRenewDomain', 1, function(array $vars) {
         return;
     }
 
-    $call = function(string $action, array $data = []) use ($adminUsername) {
+    $call = function (string $action, array $data = []) use ($adminUsername) {
         $res = localAPI($action, $data, $adminUsername);
         if (!is_array($res) || ($res['result'] ?? '') !== 'success') {
             $msg = is_array($res) ? ($res['message'] ?? 'Unknown error') : 'Unknown error';
@@ -96,11 +109,11 @@ add_hook('PreRegistrarRenewDomain', 1, function(array $vars) {
         $logBoth("Triggered ({$mode} mode)");
         $addAdminNote("Migration triggered ({$mode} mode)");
 
-        $unlockStatus = 'not attempted';
+        $unlockStatus    = 'not attempted';
         $idProtectStatus = 'not attempted';
-        $eppCode = '';
+        $eppCode         = '';
 
-        // 2) Unlock domain (ALWAYS in dry run AND live mode)
+        // 2) Unlock domain (best-effort)
         if ($unlockDomain) {
             try {
                 $call('DomainUpdateLockingStatus', [
@@ -117,7 +130,7 @@ add_hook('PreRegistrarRenewDomain', 1, function(array $vars) {
             }
         }
 
-        // 3) Disable ID Protection (ALWAYS in dry run AND live mode)
+        // 3) Disable ID Protection (best-effort)
         if ($disableIdProtect) {
             try {
                 $call('DomainToggleIdProtect', [
@@ -134,9 +147,9 @@ add_hook('PreRegistrarRenewDomain', 1, function(array $vars) {
             }
         }
 
-        // 4) Request EPP (ALWAYS in dry run AND live mode)
+        // 4) Request EPP (best-effort)
         try {
-            $eppRes = $call('DomainRequestEPP', ['domainid' => $domainId]);
+            $eppRes  = $call('DomainRequestEPP', ['domainid' => $domainId]);
             $eppCode = trim(html_entity_decode((string)($eppRes['eppcode'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
 
             if ($eppCode === '') {
@@ -153,46 +166,118 @@ add_hook('PreRegistrarRenewDomain', 1, function(array $vars) {
 
         // 5) Summary to admin notes
         $summary = "Migration summary - Unlock: {$unlockStatus}, ID Protect: {$idProtectStatus}, EPP: " .
-                   ($eppCode !== '' ? 'obtained' : 'not obtained');
+            ($eppCode !== '' ? 'obtained' : 'not obtained');
         $addAdminNote($summary);
 
+        // If we can't submit transfer (no EPP) and we don't want to mark pending, stop here.
+        if (!$dryRun && $eppCode === '' && !$markPendingWithoutEpp) {
+            $logBoth("LIVE: EPP missing; not flipping registrar/status (markPendingWithoutEpp=false)");
+            $addAdminNote("LIVE: EPP missing; transfer not submitted; registrar/status not changed");
+            return [
+                'abortWithError' =>
+                    "Renewal replaced by transfer to " . ucfirst($targetRegistrar) .
+                    ", but EPP was not returned (check email). No transfer submitted yet.",
+            ];
+        }
+
         if ($dryRun) {
-            // DRY RUN: Don't change registrar or submit transfer
             $logBoth("DRY RUN: Skipping registrar change and transfer submission");
             $addAdminNote("DRY RUN: Would change registrar to {$targetRegistrar} and submit transfer");
 
             return [
-                'abortWithError' => "DRY RUN: Renewal aborted for testing. Check Activity Log and domain admin notes. No transfer initiated."
-            ];
-        } else {
-            // LIVE MODE: Actually change registrar and submit transfer
-
-            // 6) Switch registrar + set Pending Transfer
-            $call('UpdateClientDomain', [
-                'domainid'  => $domainId,
-                'registrar' => $targetRegistrar,
-                'status'    => 'Pending Transfer',
-            ]);
-            $logBoth("Updated WHMCS: registrar={$targetRegistrar}, status=Pending Transfer");
-            $addAdminNote("Registrar changed to {$targetRegistrar}, status set to Pending Transfer");
-
-            // 7) Submit transfer if EPP available
-            if ($eppCode !== '') {
-                $call('DomainTransfer', [
-                    'domainid' => $domainId,
-                    'eppcode'  => $eppCode,
-                ]);
-                $logBoth("Transfer submitted to {$targetRegistrar}");
-                $addAdminNote("Transfer submitted to {$targetRegistrar}");
-            }
-
-            return [
-                'abortWithError' =>
-                    $eppCode === ''
-                    ? "Renewal replaced by transfer to " . ucfirst($targetRegistrar) . ". EPP requested but not returned (check email). Domain set to Pending Transfer."
-                    : "Renewal replaced by " . ucfirst($targetRegistrar) . " transfer (submitted). Domain set to Pending Transfer; dates will update via Domain Sync.",
+                'abortWithError' => "DRY RUN: Renewal aborted for testing. Check Activity Log and domain admin notes. No transfer initiated.",
             ];
         }
+
+        // ---------------- LIVE MODE ----------------
+
+        // 6) Switch registrar + set Pending Transfer (DB-level) + optional donotrenew=1
+        $alreadyPending = false;
+
+        Capsule::connection()->transaction(function () use (
+            $domainId,
+            $targetRegistrar,
+            $setDoNotRenewDuringTransfer,
+            &$alreadyPending
+        ) {
+            $locked = Capsule::table('tbldomains')
+                ->where('id', $domainId)
+                ->lockForUpdate()
+                ->first();
+
+            if (!$locked) {
+                throw new \RuntimeException("Domain ID {$domainId} not found inside transaction");
+            }
+
+            $status = strtolower(trim((string)($locked->status ?? '')));
+            if ($status === 'pending transfer') {
+                $alreadyPending = true;
+                return; // idempotent exit
+            }
+
+            $update = [
+                'registrar' => $targetRegistrar,
+                'status'    => 'Pending Transfer',
+            ];
+
+            if ($setDoNotRenewDuringTransfer) {
+                $update['donotrenew'] = 1;
+            }
+
+            $updated = Capsule::table('tbldomains')
+                ->where('id', $domainId)
+                ->update($update);
+
+            if ($updated < 1) {
+                throw new \RuntimeException("Failed to update tbldomains (no rows updated)");
+            }
+        });
+
+        if ($alreadyPending) {
+            $logBoth("Already Pending Transfer — skipping DB flip + transfer submit");
+            $addAdminNote("Already Pending Transfer — skipped");
+            return ['abortWithSuccess' => true];
+        }
+
+        $logBoth("Updated WHMCS DB: registrar={$targetRegistrar}, status=Pending Transfer" .
+            ($setDoNotRenewDuringTransfer ? ", donotrenew=1" : ""));
+        $addAdminNote("Registrar changed to {$targetRegistrar}, status set to Pending Transfer" .
+            ($setDoNotRenewDuringTransfer ? ", donotrenew=1" : ""));
+
+        // 6b) Optional: set type=Transfer in WHMCS (supported by UpdateClientDomain)
+        try {
+            $call('UpdateClientDomain', [
+                'domainid' => $domainId,
+                'type'     => 'Transfer',
+            ]);
+            $logBoth("Updated WHMCS type=Transfer");
+            $addAdminNote("WHMCS type set to Transfer");
+        } catch (\Throwable $e) {
+            $logBoth("UpdateClientDomain(type=Transfer) failed (non-fatal): " . $e->getMessage());
+            $addAdminNote("UpdateClientDomain(type=Transfer) failed (non-fatal): " . $e->getMessage());
+        }
+
+        // 7) Submit transfer (only if EPP available, unless you want manual EPP flow)
+        if ($eppCode !== '') {
+            $call('DomainTransfer', [
+                'domainid' => $domainId,
+                'eppcode'  => $eppCode,
+            ]);
+            $logBoth("Transfer submitted to {$targetRegistrar}");
+            $addAdminNote("Transfer submitted to {$targetRegistrar}");
+        } else {
+            $logBoth("Transfer NOT submitted (no EPP available)");
+            $addAdminNote("Transfer NOT submitted (no EPP available)");
+        }
+
+        return [
+            'abortWithError' =>
+                $eppCode === ''
+                    ? "Renewal replaced by transfer to " . ucfirst($targetRegistrar) .
+                      ". EPP requested but not returned (check email). Domain set to Pending Transfer."
+                    : "Renewal replaced by " . ucfirst($targetRegistrar) .
+                      " transfer (submitted). Domain set to Pending Transfer; dates will update via Domain Sync.",
+        ];
 
     } catch (\Throwable $e) {
         $logBoth("FAILED: " . $e->getMessage());
