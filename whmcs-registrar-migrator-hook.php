@@ -5,7 +5,7 @@ use WHMCS\Database\Capsule;
  * Replace renewal with a transfer (CNIC -> OpenProvider) on paid renewal attempt.
  * WHMCS 8.13.1
  *
- * Also logs every trigger/decision/result into mod_domain_migration (addon table).
+ * Logs important events into mod_domain_migration (addon table), with noise control.
  *
  * REQUIREMENT:
  *   - Install/activate the addon module that creates `mod_domain_migration` table.
@@ -23,15 +23,14 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
 
     // Safety: only run for these domains (lowercase). Keep empty [] to allow all.
     $allowlistDomains = [
-        'myipnetworks.com', // test domain
-        // add more, or leave empty for all
+        // 'myipnetworks.com', 'nixpal.com',
     ];
 
     // Optional: never run for these domains (lowercase)
     $blocklistDomains = [];
 
     // Dry run mode: still does unlock/idprotect/epp, but DOES NOT change registrar or submit transfer.
-    $dryRun = true; // SET TO false WHEN READY
+    $dryRun = false; // SET TO false WHEN READY
 
     // Best-effort steps
     $unlockDomain     = true;
@@ -45,9 +44,19 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
     $markPendingWithoutEpp = false;
 
     // If true, store EPP in addon table too.
-    // (You said you want it for verification; OK.)
     $storeEppInAddonTable = true;
-    // ----------------------------------------
+
+    // -------- NOISE CONTROL (NEW) ----------
+    // If false: do NOT store "skipped" rows (registrar mismatch, already on target, already pending, etc.)
+    $auditSkipped = false;
+
+    // If true: store allow/block list blocks as "blocked"
+    $auditBlocked = true;
+
+    // If true: keep Activity Log entries for skipped cases (registrar mismatch etc.)
+    // Recommend false if you also want to reduce WHMCS Activity Log spam.
+    $logSkippedToActivityLog = false;
+    // ---------------------------------------
 
     $params    = $vars['params'] ?? [];
     $domainId  = (int)($params['domainid'] ?? 0);
@@ -68,7 +77,7 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
 
     $logPrefix = strtoupper($triggerOnlyIfCurrentRegistrar) . '→' . strtoupper($targetRegistrar);
 
-    $logBoth = function (string $msg) use ($domain, $domainId, $currentRegistrar, $logPrefix) {
+    $logActivityMsg = function (string $msg) use ($domain, $domainId, $currentRegistrar, $logPrefix) {
         logActivity("[{$logPrefix}] {$domain} (ID {$domainId}, registrar={$currentRegistrar}) - {$msg}");
     };
 
@@ -96,16 +105,13 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
         }
     })();
 
-    $migId = 0;
-
-    $dmInsert = function (array $data) use ($logPrefix, $addonTableExists, &$migId) {
+    $dmInsert = function (array $data) use ($logPrefix, $addonTableExists) {
         if (!$addonTableExists) return 0;
         try {
             $now = date('Y-m-d H:i:s');
             $data['created_at'] = $data['created_at'] ?? $now;
             $data['updated_at'] = $data['updated_at'] ?? $now;
-            $migId = (int) Capsule::table('mod_domain_migration')->insertGetId($data);
-            return $migId;
+            return (int) Capsule::table('mod_domain_migration')->insertGetId($data);
         } catch (\Throwable $e) {
             logActivity("[{$logPrefix}] mod_domain_migration insert failed: " . $e->getMessage());
             return 0;
@@ -122,78 +128,101 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
         }
     };
 
-    $dmSetStatus = function (string $status, string $error = null, array $extra = []) use (&$migId, $dmUpdate) {
+    $dmSetStatus = function (int $id, string $status, string $error = null, array $extra = []) use ($dmUpdate) {
+        if ($id <= 0) return;
         $data = array_merge(['status' => $status], $extra);
         if ($error !== null && $error !== '') {
             $data['error'] = $error;
         }
-        $dmUpdate($migId, $data);
+        $dmUpdate($id, $data);
     };
     // ----------------------------------------------------------------------
 
-    // 0) Allow/block list gating
+    // Helper: optional audit skipped
+    $auditSkipRow = function (string $why) use (
+        $auditSkipped, $dmInsert,
+        $domainId, $domain, $clientId, $invoiceId,
+        $currentRegistrar, $targetRegistrar, $dryRun
+    ) {
+        if (!$auditSkipped) return;
+        $dmInsert([
+            'domain_id'     => $domainId,
+            'domain'        => $domain,
+            'client_id'     => $clientId ?: null,
+            'invoice_id'    => $invoiceId ?: null,
+            'old_registrar' => $currentRegistrar,
+            'new_registrar' => $targetRegistrar,
+            'dry_run'       => $dryRun ? 1 : 0,
+            'status'        => 'skipped',
+            'error'         => $why,
+        ]);
+    };
+
+    // ---------------- GATING (NOISE-FREE) ----------------
+
+    // 0) Allowlist gating
     if (!empty($allowlistDomains) && !in_array($domain, array_map('strtolower', $allowlistDomains), true)) {
-        // log as blocked (optional)
-        $dmInsert([
-            'domain_id'     => $domainId,
-            'domain'        => $domain,
-            'client_id'     => $clientId ?: null,
-            'invoice_id'    => $invoiceId ?: null,
-            'old_registrar' => $currentRegistrar,
-            'new_registrar' => $targetRegistrar,
-            'dry_run'       => $dryRun ? 1 : 0,
-            'status'        => 'blocked',
-            'error'         => 'Blocked: not in allowlist',
-        ]);
-        return;
-    }
-    if (!empty($blocklistDomains) && in_array($domain, array_map('strtolower', $blocklistDomains), true)) {
-        $dmInsert([
-            'domain_id'     => $domainId,
-            'domain'        => $domain,
-            'client_id'     => $clientId ?: null,
-            'invoice_id'    => $invoiceId ?: null,
-            'old_registrar' => $currentRegistrar,
-            'new_registrar' => $targetRegistrar,
-            'dry_run'       => $dryRun ? 1 : 0,
-            'status'        => 'blocked',
-            'error'         => 'Blocked: in blocklist',
-        ]);
+        if ($auditBlocked) {
+            $dmInsert([
+                'domain_id'     => $domainId,
+                'domain'        => $domain,
+                'client_id'     => $clientId ?: null,
+                'invoice_id'    => $invoiceId ?: null,
+                'old_registrar' => $currentRegistrar,
+                'new_registrar' => $targetRegistrar,
+                'dry_run'       => $dryRun ? 1 : 0,
+                'status'        => 'blocked',
+                'error'         => 'Blocked: not in allowlist',
+            ]);
+        }
+        if ($logSkippedToActivityLog) {
+            $logActivityMsg("Blocked (not in allowlist)");
+        }
         return;
     }
 
-    // 1) Only trigger if current registrar matches
+    // 0b) Blocklist gating
+    if (!empty($blocklistDomains) && in_array($domain, array_map('strtolower', $blocklistDomains), true)) {
+        if ($auditBlocked) {
+            $dmInsert([
+                'domain_id'     => $domainId,
+                'domain'        => $domain,
+                'client_id'     => $clientId ?: null,
+                'invoice_id'    => $invoiceId ?: null,
+                'old_registrar' => $currentRegistrar,
+                'new_registrar' => $targetRegistrar,
+                'dry_run'       => $dryRun ? 1 : 0,
+                'status'        => 'blocked',
+                'error'         => 'Blocked: in blocklist',
+            ]);
+        }
+        if ($logSkippedToActivityLog) {
+            $logActivityMsg("Blocked (in blocklist)");
+        }
+        return;
+    }
+
+    // 1) Registrar mismatch -> quiet return (no spam)
     if ($triggerOnlyIfCurrentRegistrar !== '' &&
         $currentRegistrar !== strtolower($triggerOnlyIfCurrentRegistrar)) {
-        $dmInsert([
-            'domain_id'     => $domainId,
-            'domain'        => $domain,
-            'client_id'     => $clientId ?: null,
-            'invoice_id'    => $invoiceId ?: null,
-            'old_registrar' => $currentRegistrar,
-            'new_registrar' => $targetRegistrar,
-            'dry_run'       => $dryRun ? 1 : 0,
-            'status'        => 'skipped',
-            'error'         => 'Skipped: registrar mismatch',
-        ]);
+
+        $auditSkipRow('Skipped: registrar mismatch');
+        if ($logSkippedToActivityLog) {
+            $logActivityMsg("Skipped: registrar mismatch");
+        }
         return;
     }
 
-    // If already on target registrar, do nothing
+    // 2) Already on target registrar -> quiet return
     if ($currentRegistrar === strtolower($targetRegistrar)) {
-        $dmInsert([
-            'domain_id'     => $domainId,
-            'domain'        => $domain,
-            'client_id'     => $clientId ?: null,
-            'invoice_id'    => $invoiceId ?: null,
-            'old_registrar' => $currentRegistrar,
-            'new_registrar' => $targetRegistrar,
-            'dry_run'       => $dryRun ? 1 : 0,
-            'status'        => 'skipped',
-            'error'         => 'Skipped: already on target registrar',
-        ]);
+        $auditSkipRow('Skipped: already on target registrar');
+        if ($logSkippedToActivityLog) {
+            $logActivityMsg("Skipped: already on target registrar");
+        }
         return;
     }
+
+    // ---------------- EXECUTION (LOG ONLY REAL RUNS) ----------------
 
     $call = function (string $action, array $data = []) use ($adminUsername) {
         $res = localAPI($action, $data, $adminUsername);
@@ -204,7 +233,7 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
         return $res;
     };
 
-    // Create addon log row as soon as we decide we're "triggered"
+    // Create addon log row NOW (we are truly triggered)
     $mode = $dryRun ? 'DRY RUN' : 'LIVE';
     $migId = $dmInsert([
         'domain_id'      => $domainId,
@@ -218,14 +247,14 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
     ]);
 
     try {
-        $logBoth("Triggered ({$mode} mode)");
+        $logActivityMsg("Triggered ({$mode} mode)");
         $addAdminNote("Migration triggered ({$mode} mode)");
 
         $unlockStatus    = 'not attempted';
         $idProtectStatus = 'not attempted';
         $eppCode         = '';
 
-        // 2) Unlock domain (best-effort)
+        // 3) Unlock domain (best-effort)
         if ($unlockDomain) {
             try {
                 $call('DomainUpdateLockingStatus', [
@@ -233,18 +262,18 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
                     'lockstatus' => false,
                 ]);
                 $unlockStatus = 'success';
-                $logBoth("Domain unlocked successfully");
+                $logActivityMsg("Domain unlocked successfully");
                 $addAdminNote("Domain unlocked");
                 $dmUpdate($migId, ['unlock_ok' => 1]);
             } catch (\Throwable $e) {
                 $unlockStatus = 'failed: ' . $e->getMessage();
-                $logBoth("Unlock failed: " . $e->getMessage());
+                $logActivityMsg("Unlock failed: " . $e->getMessage());
                 $addAdminNote("Unlock failed: " . $e->getMessage());
                 $dmUpdate($migId, ['unlock_ok' => 0]);
             }
         }
 
-        // 3) Disable ID Protection (best-effort)
+        // 4) Disable ID Protection (best-effort)
         if ($disableIdProtect) {
             try {
                 $call('DomainToggleIdProtect', [
@@ -252,18 +281,18 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
                     'idprotect' => false,
                 ]);
                 $idProtectStatus = 'success';
-                $logBoth("ID Protection disabled successfully");
+                $logActivityMsg("ID Protection disabled successfully");
                 $addAdminNote("ID Protection disabled");
                 $dmUpdate($migId, ['idprotect_ok' => 1]);
             } catch (\Throwable $e) {
                 $idProtectStatus = 'failed: ' . $e->getMessage();
-                $logBoth("Disable ID Protection failed: " . $e->getMessage());
+                $logActivityMsg("Disable ID Protection failed: " . $e->getMessage());
                 $addAdminNote("ID Protection disable failed: " . $e->getMessage());
                 $dmUpdate($migId, ['idprotect_ok' => 0]);
             }
         }
 
-        // 4) Request EPP (best-effort)
+        // 5) Request EPP (best-effort)
         try {
             $eppRes  = $call('DomainRequestEPP', ['domainid' => $domainId]);
             $eppCode = trim(html_entity_decode((string)($eppRes['eppcode'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
@@ -273,18 +302,18 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
             }
 
             if ($eppCode === '') {
-                $logBoth("EPP requested but not returned (likely emailed to registrant)");
+                $logActivityMsg("EPP requested but not returned (likely emailed to registrant)");
                 $addAdminNote("EPP code requested (not returned via API - check email)");
             } else {
-                $logBoth("EPP code obtained successfully (length=" . strlen($eppCode) . ")");
+                $logActivityMsg("EPP code obtained successfully (length=" . strlen($eppCode) . ")");
                 $addAdminNote("EPP code obtained: {$eppCode}");
             }
         } catch (\Throwable $e) {
-            $logBoth("EPP request failed: " . $e->getMessage());
+            $logActivityMsg("EPP request failed: " . $e->getMessage());
             $addAdminNote("EPP request failed: " . $e->getMessage());
         }
 
-        // 5) Summary to admin notes
+        // Summary to admin notes
         $summary = "Migration summary - Unlock: {$unlockStatus}, ID Protect: {$idProtectStatus}, EPP: " .
             ($eppCode !== '' ? 'obtained' : 'not obtained');
         $addAdminNote($summary);
@@ -292,9 +321,10 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
         // If we can't submit transfer (no EPP) and we don't want to mark pending, stop here.
         if (!$dryRun && $eppCode === '' && !$markPendingWithoutEpp) {
             $msg = "EPP missing; not flipping registrar/status (markPendingWithoutEpp=false)";
-            $logBoth("LIVE: {$msg}");
+            $logActivityMsg("LIVE: {$msg}");
             $addAdminNote("LIVE: {$msg}");
-            $dmSetStatus('failed', 'EPP missing; transfer not submitted; registrar/status not changed', [
+
+            $dmSetStatus($migId, 'failed', 'EPP missing; transfer not submitted; registrar/status not changed', [
                 'transfer_submitted' => 0,
             ]);
 
@@ -306,9 +336,10 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
         }
 
         if ($dryRun) {
-            $logBoth("DRY RUN: Skipping registrar change and transfer submission");
+            $logActivityMsg("DRY RUN: Skipping registrar change and transfer submission");
             $addAdminNote("DRY RUN: Would change registrar to {$targetRegistrar} and submit transfer");
-            $dmSetStatus('skipped', 'Dry run: no registrar change / no transfer submit', [
+
+            $dmSetStatus($migId, 'skipped', 'Dry run: no registrar change / no transfer submit', [
                 'transfer_submitted' => 0,
             ]);
 
@@ -319,7 +350,7 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
 
         // ---------------- LIVE MODE ----------------
 
-        // 6) Switch registrar + set Pending Transfer (DB-level) + optional donotrenew=1
+        // 6) Switch registrar + set Pending Transfer + optional donotrenew=1 (DB-level)
         $alreadyPending = false;
 
         Capsule::connection()->transaction(function () use (
@@ -340,7 +371,7 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
             $status = strtolower(trim((string)($locked->status ?? '')));
             if ($status === 'pending transfer') {
                 $alreadyPending = true;
-                return; // idempotent exit
+                return;
             }
 
             $update = [
@@ -352,25 +383,34 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
                 $update['donotrenew'] = 1;
             }
 
-            $updated = Capsule::table('tbldomains')
-                ->where('id', $domainId)
-                ->update($update);
-
+            $updated = Capsule::table('tbldomains')->where('id', $domainId)->update($update);
             if ($updated < 1) {
                 throw new \RuntimeException("Failed to update tbldomains (no rows updated)");
             }
         });
 
+        // Already pending -> avoid duplicate transfer; remove the row unless you want skip auditing
         if ($alreadyPending) {
-            $logBoth("Already Pending Transfer — skipping DB flip + transfer submit");
+            $logActivityMsg("Already Pending Transfer — skipping DB flip + transfer submit");
             $addAdminNote("Already Pending Transfer — skipped");
-            $dmSetStatus('skipped', 'Already Pending Transfer; skipped to avoid duplicates', [
-                'transfer_submitted' => 0,
-            ]);
+
+            if ($auditSkipped) {
+                $dmSetStatus($migId, 'skipped', 'Already Pending Transfer; skipped to avoid duplicates', [
+                    'transfer_submitted' => 0,
+                ]);
+            } else {
+                // Remove the 'triggered' audit row to avoid noise
+                try {
+                    Capsule::table('mod_domain_migration')->where('id', $migId)->delete();
+                } catch (\Throwable $e) {
+                    // ignore
+                }
+            }
+
             return ['abortWithSuccess' => true];
         }
 
-        $logBoth("Updated WHMCS DB: registrar={$targetRegistrar}, status=Pending Transfer" .
+        $logActivityMsg("Updated WHMCS DB: registrar={$targetRegistrar}, status=Pending Transfer" .
             ($setDoNotRenewDuringTransfer ? ", donotrenew=1" : ""));
         $addAdminNote("Registrar changed to {$targetRegistrar}, status set to Pending Transfer" .
             ($setDoNotRenewDuringTransfer ? ", donotrenew=1" : ""));
@@ -381,31 +421,32 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
                 'domainid' => $domainId,
                 'type'     => 'Transfer',
             ]);
-            $logBoth("Updated WHMCS type=Transfer");
+            $logActivityMsg("Updated WHMCS type=Transfer");
             $addAdminNote("WHMCS type set to Transfer");
         } catch (\Throwable $e) {
-            $logBoth("UpdateClientDomain(type=Transfer) failed (non-fatal): " . $e->getMessage());
+            $logActivityMsg("UpdateClientDomain(type=Transfer) failed (non-fatal): " . $e->getMessage());
             $addAdminNote("UpdateClientDomain(type=Transfer) failed (non-fatal): " . $e->getMessage());
         }
 
-        // 7) Submit transfer (only if EPP available, unless you want manual EPP flow)
+        // 7) Submit transfer
         if ($eppCode !== '') {
             $call('DomainTransfer', [
                 'domainid' => $domainId,
                 'eppcode'  => $eppCode,
             ]);
-            $logBoth("Transfer submitted to {$targetRegistrar}");
+
+            $logActivityMsg("Transfer submitted to {$targetRegistrar}");
             $addAdminNote("Transfer submitted to {$targetRegistrar}");
 
-            $dmSetStatus('submitted', null, [
+            $dmSetStatus($migId, 'submitted', null, [
                 'transfer_submitted' => 1,
             ]);
         } else {
-            $logBoth("Transfer NOT submitted (no EPP available)");
+            // Reached here only if markPendingWithoutEpp=true
+            $logActivityMsg("Transfer NOT submitted (no EPP available)");
             $addAdminNote("Transfer NOT submitted (no EPP available)");
 
-            // If you reached here with empty EPP, it means markPendingWithoutEpp=true
-            $dmSetStatus('triggered', 'No EPP; Pending Transfer set but transfer not submitted', [
+            $dmSetStatus($migId, 'triggered', 'No EPP; Pending Transfer set but transfer not submitted', [
                 'transfer_submitted' => 0,
             ]);
         }
@@ -420,9 +461,9 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
         ];
 
     } catch (\Throwable $e) {
-        $logBoth("FAILED: " . $e->getMessage());
+        $logActivityMsg("FAILED: " . $e->getMessage());
         $addAdminNote("Migration FAILED: " . $e->getMessage());
-        $dmSetStatus('failed', $e->getMessage());
+        $dmSetStatus($migId, 'failed', $e->getMessage());
 
         return [
             'abortWithError' => "{$logPrefix} migration failed: " . $e->getMessage(),
