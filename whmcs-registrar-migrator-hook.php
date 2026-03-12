@@ -75,6 +75,15 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
     $currentRegistrar = strtolower(trim((string)($row->registrar ?? '')));
     $clientId         = (int)($row->userid ?? 0);
 
+    // Preserve current nameservers so transfer submission can keep DNS delegation intact.
+    $nameservers = [];
+    for ($i = 1; $i <= 5; $i++) {
+        $ns = trim((string)($row->{"ns{$i}"} ?? ''));
+        if ($ns !== '') {
+            $nameservers[$i] = $ns;
+        }
+    }
+
     $logPrefix = strtoupper($triggerOnlyIfCurrentRegistrar) . '→' . strtoupper($targetRegistrar);
 
     $logActivityMsg = function (string $msg) use ($domain, $domainId, $currentRegistrar, $logPrefix) {
