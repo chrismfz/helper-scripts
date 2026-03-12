@@ -233,6 +233,55 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
         return $res;
     };
 
+    $resolveNameservers = function () use ($call, $domainId) {
+        $nameservers = [];
+
+        // Preferred source: registrar module/WHMCS live nameserver query.
+        try {
+            $nsRes = $call('DomainGetNameservers', ['domainid' => $domainId]);
+            for ($i = 1; $i <= 5; $i++) {
+                $ns = trim((string)($nsRes["ns{$i}"] ?? ''));
+                if ($ns !== '') {
+                    $nameservers[$i] = $ns;
+                }
+            }
+            if (!empty($nameservers)) {
+                return ['nameservers' => $nameservers, 'source' => 'DomainGetNameservers'];
+            }
+        } catch (\Throwable $e) {
+            // ignore and fallback
+        }
+
+        // Fallback source: WHMCS client-domain API payload.
+        try {
+            $domainRes = $call('GetClientsDomains', [
+                'domainid' => $domainId,
+                'limitnum' => 1,
+            ]);
+
+            $entry = $domainRes['domains']['domain'][0] ?? null;
+            if (is_array($entry)) {
+                for ($i = 1; $i <= 5; $i++) {
+                    $ns = trim((string)($entry["ns{$i}"] ?? $entry["nameserver{$i}"] ?? ''));
+                    if ($ns !== '') {
+                        $nameservers[$i] = $ns;
+                    }
+                }
+            }
+            if (!empty($nameservers)) {
+                return ['nameservers' => $nameservers, 'source' => 'GetClientsDomains'];
+            }
+        } catch (\Throwable $e) {
+            // ignore and return empty
+        }
+
+        return ['nameservers' => [], 'source' => 'none'];
+    };
+
+    $resolvedNameservers = $resolveNameservers();
+    $nameservers = $resolvedNameservers['nameservers'];
+    $nameserverSource = $resolvedNameservers['source'];
+
     // Create addon log row NOW (we are truly triggered)
     $mode = $dryRun ? 'DRY RUN' : 'LIVE';
     $migId = $dmInsert([
@@ -317,6 +366,12 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
         $summary = "Migration summary - Unlock: {$unlockStatus}, ID Protect: {$idProtectStatus}, EPP: " .
             ($eppCode !== '' ? 'obtained' : 'not obtained');
         $addAdminNote($summary);
+
+        if (!empty($nameservers)) {
+            $addAdminNote('Nameservers preserved for transfer (' . $nameserverSource . '): ' . implode(', ', $nameservers));
+        } else {
+            $addAdminNote('No nameservers resolved via API; transfer will use registrar/WHMCS defaults');
+        }
 
         // If we can't submit transfer (no EPP) and we don't want to mark pending, stop here.
         if (!$dryRun && $eppCode === '' && !$markPendingWithoutEpp) {
@@ -430,13 +485,26 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
 
         // 7) Submit transfer
         if ($eppCode !== '') {
-            $call('DomainTransfer', [
+            $transferPayload = [
                 'domainid' => $domainId,
                 'eppcode'  => $eppCode,
-            ]);
+            ];
 
-            $logActivityMsg("Transfer submitted to {$targetRegistrar}");
-            $addAdminNote("Transfer submitted to {$targetRegistrar}");
+            // WHMCS transfer APIs commonly accept ns1..ns5.
+            foreach ($nameservers as $index => $ns) {
+                $transferPayload["ns{$index}"] = $ns;
+            }
+
+            $call('DomainTransfer', $transferPayload);
+
+            $logActivityMsg(
+                "Transfer submitted to {$targetRegistrar}" .
+                (!empty($nameservers) ? ' with preserved nameservers' : '')
+            );
+            $addAdminNote(
+                "Transfer submitted to {$targetRegistrar}" .
+                (!empty($nameservers) ? ' using nameservers: ' . implode(', ', $nameservers) : '')
+            );
 
             $dmSetStatus($migId, 'submitted', null, [
                 'transfer_submitted' => 1,
