@@ -75,6 +75,15 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
     $currentRegistrar = strtolower(trim((string)($row->registrar ?? '')));
     $clientId         = (int)($row->userid ?? 0);
 
+    // Preserve current nameservers so transfer submission can keep DNS delegation intact.
+    $nameservers = [];
+    for ($i = 1; $i <= 5; $i++) {
+        $ns = trim((string)($row->{"ns{$i}"} ?? ''));
+        if ($ns !== '') {
+            $nameservers[$i] = $ns;
+        }
+    }
+
     $logPrefix = strtoupper($triggerOnlyIfCurrentRegistrar) . '→' . strtoupper($targetRegistrar);
 
     $logActivityMsg = function (string $msg) use ($domain, $domainId, $currentRegistrar, $logPrefix) {
@@ -318,6 +327,10 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
             ($eppCode !== '' ? 'obtained' : 'not obtained');
         $addAdminNote($summary);
 
+        if (!empty($nameservers)) {
+            $addAdminNote('Nameservers preserved for transfer: ' . implode(', ', $nameservers));
+        }
+
         // If we can't submit transfer (no EPP) and we don't want to mark pending, stop here.
         if (!$dryRun && $eppCode === '' && !$markPendingWithoutEpp) {
             $msg = "EPP missing; not flipping registrar/status (markPendingWithoutEpp=false)";
@@ -430,13 +443,26 @@ add_hook('PreRegistrarRenewDomain', 1, function (array $vars) {
 
         // 7) Submit transfer
         if ($eppCode !== '') {
-            $call('DomainTransfer', [
+            $transferPayload = [
                 'domainid' => $domainId,
                 'eppcode'  => $eppCode,
-            ]);
+            ];
 
-            $logActivityMsg("Transfer submitted to {$targetRegistrar}");
-            $addAdminNote("Transfer submitted to {$targetRegistrar}");
+            // WHMCS transfer APIs commonly accept ns1..ns5.
+            foreach ($nameservers as $index => $ns) {
+                $transferPayload["ns{$index}"] = $ns;
+            }
+
+            $call('DomainTransfer', $transferPayload);
+
+            $logActivityMsg(
+                "Transfer submitted to {$targetRegistrar}" .
+                (!empty($nameservers) ? ' with preserved nameservers' : '')
+            );
+            $addAdminNote(
+                "Transfer submitted to {$targetRegistrar}" .
+                (!empty($nameservers) ? ' using nameservers: ' . implode(', ', $nameservers) : '')
+            );
 
             $dmSetStatus($migId, 'submitted', null, [
                 'transfer_submitted' => 1,
