@@ -1,7 +1,26 @@
 #!/usr/bin/env bash
 # ============================================================
 # KSPP Hardening Profile Script
-# BLS/grubby aware, idempotent, safer profile switching
+# ------------------------------------------------------------
+# BLS/grubby aware
+# Idempotent profile switching
+# Runtime + next-boot verification
+#
+# Modes:
+#   safe
+#   strict
+#   none
+#   status
+#   verify [safe|strict|none|auto]
+#
+# Notes:
+#   - Boot args require reboot before becoming active.
+#   - This script only manages the boot args listed in
+#     MANAGED_ARG_KEYS.
+#   - CVE-2026-31431 / Copy Fail workaround is currently included
+#     in both safe and strict via:
+#       initcall_blacklist=algif_aead_init
+#     Remove it later once all relevant kernels are patched.
 # ============================================================
 
 set -Eeuo pipefail
@@ -43,8 +62,8 @@ STRICT_SYSCTL=(
   "kernel.yama.ptrace_scope=2"
 
   # Strict only.
-  # Value 1 blocks unprivileged io_uring unless allowed by group/capability.
-  # Value 2 would disable io_uring globally and is more likely to break things.
+  # 1 blocks unprivileged io_uring unless allowed by group/capability.
+  # 2 disables io_uring globally and is more likely to break things.
   "kernel.io_uring_disabled=1"
 )
 
@@ -55,6 +74,12 @@ STRICT_SYSCTL=(
 COMMON_ARGS=(
   "page_alloc.shuffle=1"
   "randomize_kstack_offset=on"
+
+  # Temporary mitigation for CVE-2026-31431 / Copy Fail.
+  # Prevents algif_aead_init() from running during boot.
+  # Requires reboot.
+  # Remove later once all relevant kernels are patched.
+  "initcall_blacklist=algif_aead_init"
 )
 
 SAFE_ARGS=(
@@ -85,6 +110,10 @@ MANAGED_ARG_KEYS=(
   "randomize_kstack_offset"
   "debugfs"
   "vsyscall"
+
+  # Temporary CVE-2026-31431 / Copy Fail mitigation.
+  # This script owns the whole initcall_blacklist key.
+  "initcall_blacklist"
 )
 
 RUNTIME_SYSCTL_KEYS=(
@@ -185,17 +214,18 @@ detect_profile() {
   local cmdline
   cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
 
-  if echo "$cmdline" | grep -qw 'init_on_alloc=1' || \
-     echo "$cmdline" | grep -qw 'init_on_free=1' || \
-     echo "$cmdline" | grep -qw 'debugfs=off' || \
-     echo "$cmdline" | grep -qw 'vsyscall=none' || \
+  if echo "$cmdline" | tr ' ' '\n' | grep -qx 'init_on_alloc=1' || \
+     echo "$cmdline" | tr ' ' '\n' | grep -qx 'init_on_free=1' || \
+     echo "$cmdline" | tr ' ' '\n' | grep -qx 'debugfs=off' || \
+     echo "$cmdline" | tr ' ' '\n' | grep -qx 'vsyscall=none' || \
      { [[ -f "$SYSCTL_FILE" ]] && grep -q '^kernel.perf_event_paranoid=3$' "$SYSCTL_FILE"; }; then
     echo "strict"
     return
   fi
 
-  if echo "$cmdline" | grep -qw 'page_alloc.shuffle=1' || \
-     echo "$cmdline" | grep -qw 'randomize_kstack_offset=on' || \
+  if echo "$cmdline" | tr ' ' '\n' | grep -qx 'page_alloc.shuffle=1' || \
+     echo "$cmdline" | tr ' ' '\n' | grep -qx 'randomize_kstack_offset=on' || \
+     echo "$cmdline" | tr ' ' '\n' | grep -qx 'initcall_blacklist=algif_aead_init' || \
      { [[ -f "$SYSCTL_FILE" ]] && grep -q '^kernel.perf_event_paranoid=2$' "$SYSCTL_FILE"; }; then
     echo "safe"
     return
@@ -550,6 +580,47 @@ verify() {
   fi
 
   echo
+  echo "[Copy Fail / algif_aead mitigation]"
+
+  if array_has_key "initcall_blacklist" "${target_args[@]}"; then
+    if echo "$cmdline" | tr ' ' '\n' | grep -qx 'initcall_blacklist=algif_aead_init'; then
+      echo "OK        initcall_blacklist=algif_aead_init is present in current cmdline"
+    else
+      echo "WARN      initcall_blacklist=algif_aead_init is not active in current cmdline"
+      echo "          Reboot is required after applying the profile."
+      failed=1
+    fi
+
+    if has_cmd python3; then
+      local afalg_test
+      afalg_test="$(
+        python3 - <<'PY' 2>&1
+import socket
+
+AF_ALG = getattr(socket, "AF_ALG", 38)
+
+try:
+    s = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)
+    s.bind(("aead", "authencesn(hmac(sha256),cbc(aes))"))
+    print("WARN: AF_ALG AEAD bind succeeded")
+except OSError as e:
+    print("OK: AF_ALG AEAD bind failed:", e)
+PY
+      )"
+
+      echo "$afalg_test"
+
+      if echo "$afalg_test" | grep -q '^WARN:'; then
+        failed=1
+      fi
+    else
+      echo "SKIP      python3 not found, cannot test AF_ALG AEAD bind"
+    fi
+  else
+    echo "SKIP      initcall_blacklist=algif_aead_init is not part of selected profile"
+  fi
+
+  echo
   echo "[Runtime sysctl values for selected profile]"
 
   if [[ "${#target_sysctl[@]}" -eq 0 ]]; then
@@ -691,7 +762,7 @@ verify() {
   echo
   echo "[Kernel config hints]"
   if [[ -r "$cfg" ]]; then
-    grep -E 'CONFIG_SHUFFLE_PAGE_ALLOCATOR|CONFIG_INIT_ON_ALLOC|CONFIG_INIT_ON_FREE|CONFIG_HAVE_ARCH_RANDOMIZE_KSTACK_OFFSET|CONFIG_RANDOMIZE_KSTACK_OFFSET|CONFIG_SLUB|CONFIG_DEBUG_FS|CONFIG_IO_URING|CONFIG_BPF_JIT|CONFIG_LEGACY_VSYSCALL' "$cfg" || true
+    grep -E 'CONFIG_SHUFFLE_PAGE_ALLOCATOR|CONFIG_INIT_ON_ALLOC|CONFIG_INIT_ON_FREE|CONFIG_HAVE_ARCH_RANDOMIZE_KSTACK_OFFSET|CONFIG_RANDOMIZE_KSTACK_OFFSET|CONFIG_SLUB|CONFIG_DEBUG_FS|CONFIG_IO_URING|CONFIG_BPF_JIT|CONFIG_LEGACY_VSYSCALL|CONFIG_CRYPTO_USER_API|CONFIG_CRYPTO_USER_API_AEAD' "$cfg" || true
   else
     echo "WARN      $cfg not readable"
   fi
@@ -701,6 +772,7 @@ verify() {
   echo "OK in /proc/cmdline means the bootloader passed it."
   echo "No unknown/invalid kernel warning means the kernel probably accepted it."
   echo "Some early/static params do not expose a runtime boolean."
+  echo "For Copy Fail mitigation, AF_ALG AEAD bind should fail after reboot."
 
   echo
   if [[ "$failed" -eq 0 ]]; then
@@ -722,13 +794,24 @@ Modes:
   none      Remove kspp.sh persistent sysctl file and managed boot args
   status    Show current runtime and next-boot state
   verify    Verify whether current boot appears to have accepted selected profile
-            Examples:
-              $0 verify
-              $0 verify safe
-              $0 verify strict
+
+Examples:
+  $0 safe
+  $0 strict
+  $0 status
+  $0 verify
+  $0 verify safe
+  $0 verify strict
+  $0 none
 
 Important:
   Boot args require reboot before appearing in /proc/cmdline.
+
+Temporary Copy Fail mitigation:
+  Both safe and strict currently include:
+    initcall_blacklist=algif_aead_init
+
+  Remove this later once all relevant kernels are patched.
 EOF
 }
 
