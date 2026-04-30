@@ -1,24 +1,20 @@
 #!/usr/bin/env bash
 # ============================================================
-# KSPP Hardening Profile Script
+# KSPP Server-Safe Hardening Script
 # ------------------------------------------------------------
-# BLS/grubby aware
-# Idempotent profile switching
-# Runtime + next-boot verification
+# Cross-distro:
+#   - RHEL/Alma/Rocky BLS/grubby
+#   - Debian/Ubuntu update-grub / grub-mkconfig
 #
-# Modes:
-#   safe
-#   strict
-#   none
-#   status
-#   verify [safe|strict|none|auto]
+# Simple modes:
+#   enable   Apply server-safe hardening
+#   disable  Remove managed boot args and sysctl file
+#   status   Show status + verification
 #
 # Notes:
 #   - Boot args require reboot before becoming active.
-#   - This script only manages the boot args listed in
-#     MANAGED_ARG_KEYS.
-#   - CVE-2026-31431 / Copy Fail workaround is currently included
-#     in both safe and strict via:
+#   - This script only manages boot args listed in MANAGED_ARG_KEYS.
+#   - Copy Fail / CVE-2026-31431 workaround is included:
 #       initcall_blacklist=algif_aead_init
 #     Remove it later once all relevant kernels are patched.
 # ============================================================
@@ -26,17 +22,16 @@
 set -Eeuo pipefail
 
 MODE="${1:-status}"
-PROFILE_ARG="${2:-auto}"
 
 SYSCTL_FILE="/etc/sysctl.d/99-kspp.conf"
 GRUB_FILE="/etc/default/grub"
 GRUB_BACKUP="/etc/default/grub.kspp.bak"
 
 # ------------------------------------------------------------
-# Sysctl profiles
+# Server-safe sysctl profile
 # ------------------------------------------------------------
 
-COMMON_SYSCTL=(
+KSPP_SYSCTL=(
   "kernel.kptr_restrict=2"
   "kernel.dmesg_restrict=1"
   "kernel.unprivileged_bpf_disabled=1"
@@ -48,30 +43,22 @@ COMMON_SYSCTL=(
   "fs.protected_regular=2"
 
   "net.core.bpf_jit_harden=2"
-)
 
-SAFE_SYSCTL=(
-  "${COMMON_SYSCTL[@]}"
-  "kernel.perf_event_paranoid=2"
+  # Stronger perf restriction, usually safe on servers.
+  "kernel.perf_event_paranoid=3"
+
+  # Keep this at 1 for compatibility/debuggability.
+  # 2 is stricter but can make support/debug workflows harder.
   "kernel.yama.ptrace_scope=1"
 )
 
-STRICT_SYSCTL=(
-  "${COMMON_SYSCTL[@]}"
-  "kernel.perf_event_paranoid=3"
-  "kernel.yama.ptrace_scope=2"
-
-  # Strict only.
-  # 1 blocks unprivileged io_uring unless allowed by group/capability.
-  # 2 disables io_uring globally and is more likely to break things.
-  "kernel.io_uring_disabled=1"
-)
-
 # ------------------------------------------------------------
-# Boot parameter profiles
+# Server-safe boot args
 # ------------------------------------------------------------
 
-COMMON_ARGS=(
+KSPP_ARGS=(
+  "slab_nomerge"
+  "init_on_alloc=1"
   "page_alloc.shuffle=1"
   "randomize_kstack_offset=on"
 
@@ -82,37 +69,13 @@ COMMON_ARGS=(
   "initcall_blacklist=algif_aead_init"
 )
 
-SAFE_ARGS=(
-  "${COMMON_ARGS[@]}"
-)
-
-STRICT_ARGS=(
-  "slab_nomerge"
-  "init_on_alloc=1"
-  "init_on_free=1"
-  "${COMMON_ARGS[@]}"
-
-  # Strict only.
-  "debugfs=off"
-  "vsyscall=none"
-)
-
-EMPTY_ARGS=()
-EMPTY_SYSCTL=()
-
-# All boot arg keys managed by this script.
-# Used when switching profiles, so stale strict/safe args are removed first.
+# This script owns these boot arg keys.
+# disable removes them. enable removes stale values first, then adds KSPP_ARGS.
 MANAGED_ARG_KEYS=(
   "slab_nomerge"
   "init_on_alloc"
-  "init_on_free"
   "page_alloc.shuffle"
   "randomize_kstack_offset"
-  "debugfs"
-  "vsyscall"
-
-  # Temporary CVE-2026-31431 / Copy Fail mitigation.
-  # This script owns the whole initcall_blacklist key.
   "initcall_blacklist"
 )
 
@@ -130,7 +93,6 @@ RUNTIME_SYSCTL_KEYS=(
   "fs.protected_regular"
 
   "net.core.bpf_jit_harden"
-  "kernel.io_uring_disabled"
 )
 
 log() {
@@ -192,62 +154,32 @@ array_has_key() {
   return 1
 }
 
-profile_args_var() {
-  case "$1" in
-    safe)   echo "SAFE_ARGS" ;;
-    strict) echo "STRICT_ARGS" ;;
-    none)   echo "EMPTY_ARGS" ;;
-    *)      die "Unknown profile: $1" ;;
-  esac
+get_kernel_log() {
+  journalctl -k -b -o cat 2>/dev/null || dmesg 2>/dev/null || true
 }
 
-profile_sysctl_var() {
-  case "$1" in
-    safe)   echo "SAFE_SYSCTL" ;;
-    strict) echo "STRICT_SYSCTL" ;;
-    none)   echo "EMPTY_SYSCTL" ;;
-    *)      die "Unknown profile: $1" ;;
-  esac
-}
+get_kernel_config_path() {
+  local cfg="/boot/config-$(uname -r)"
 
-detect_profile() {
-  local cmdline
-  cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
-
-  if echo "$cmdline" | tr ' ' '\n' | grep -qx 'init_on_alloc=1' || \
-     echo "$cmdline" | tr ' ' '\n' | grep -qx 'init_on_free=1' || \
-     echo "$cmdline" | tr ' ' '\n' | grep -qx 'debugfs=off' || \
-     echo "$cmdline" | tr ' ' '\n' | grep -qx 'vsyscall=none' || \
-     { [[ -f "$SYSCTL_FILE" ]] && grep -q '^kernel.perf_event_paranoid=3$' "$SYSCTL_FILE"; }; then
-    echo "strict"
+  if [[ -r "$cfg" ]]; then
+    echo "$cfg"
     return
   fi
 
-  if echo "$cmdline" | tr ' ' '\n' | grep -qx 'page_alloc.shuffle=1' || \
-     echo "$cmdline" | tr ' ' '\n' | grep -qx 'randomize_kstack_offset=on' || \
-     echo "$cmdline" | tr ' ' '\n' | grep -qx 'initcall_blacklist=algif_aead_init' || \
-     { [[ -f "$SYSCTL_FILE" ]] && grep -q '^kernel.perf_event_paranoid=2$' "$SYSCTL_FILE"; }; then
-    echo "safe"
-    return
-  fi
-
-  echo "none"
+  echo ""
 }
 
-resolve_profile() {
-  local requested="$1"
+read_kernel_config() {
+  local cfg
+  cfg="$(get_kernel_config_path)"
 
-  case "$requested" in
-    auto|"")
-      detect_profile
-      ;;
-    safe|strict|none)
-      echo "$requested"
-      ;;
-    *)
-      die "Unknown verify profile: $requested. Use safe, strict, none, or auto."
-      ;;
-  esac
+  if [[ -n "$cfg" ]]; then
+    cat "$cfg"
+  elif [[ -r /proc/config.gz ]] && has_cmd zcat; then
+    zcat /proc/config.gz
+  else
+    return 1
+  fi
 }
 
 apply_sysctl_file() {
@@ -258,8 +190,6 @@ apply_sysctl_file() {
 }
 
 write_sysctl_file() {
-  local -n arr="$1"
-
   log "Writing $SYSCTL_FILE"
 
   {
@@ -267,7 +197,7 @@ write_sysctl_file() {
     echo "# Do not edit manually unless you know what you are doing."
 
     local line key proc
-    for line in "${arr[@]}"; do
+    for line in "${KSPP_SYSCTL[@]}"; do
       key="${line%%=*}"
       proc="$(sysctl_proc_path "$key")"
 
@@ -337,8 +267,7 @@ remove_managed_args_from_line() {
 }
 
 update_grub_cfg() {
-  # Debian/Ubuntu wrapper. Usually runs:
-  #   grub-mkconfig -o /boot/grub/grub.cfg
+  # Debian/Ubuntu wrapper.
   if has_cmd update-grub; then
     log "Regenerating GRUB config using update-grub"
     update-grub >/dev/null
@@ -357,19 +286,13 @@ update_grub_cfg() {
 
   local cfg=""
 
-  # RHEL/Alma/Rocky legacy location
   if [[ -f /boot/grub2/grub.cfg || -d /boot/grub2 ]]; then
     cfg="/boot/grub2/grub.cfg"
-
-  # Debian/Ubuntu location
   elif [[ -f /boot/grub/grub.cfg || -d /boot/grub ]]; then
     cfg="/boot/grub/grub.cfg"
-
-  # Last-resort EFI vendor grub.cfg detection
   elif [[ -d /sys/firmware/efi ]]; then
     cfg="$(find /boot/efi/EFI -name grub.cfg 2>/dev/null | head -n1 || true)"
     [[ -n "$cfg" ]] || die "Could not find EFI grub.cfg"
-
   else
     die "Could not determine GRUB config output path"
   fi
@@ -377,7 +300,6 @@ update_grub_cfg() {
   log "Regenerating GRUB config using $mkconfig: $cfg"
   "$mkconfig" -o "$cfg" >/dev/null
 }
-
 
 apply_boot_args_bls() {
   local -a desired_args=("$@")
@@ -388,11 +310,11 @@ apply_boot_args_bls() {
     remove_args+=("$key")
   done
 
-  log "Removing old KSPP boot args from all kernels"
+  log "Removing old managed KSPP boot args from all kernels"
   grubby --update-kernel=ALL --remove-args="$(join_by_space "${remove_args[@]}")"
 
   if [[ "${#desired_args[@]}" -gt 0 ]]; then
-    log "Adding boot args to all kernels: $(join_by_space "${desired_args[@]}")"
+    log "Adding KSPP boot args to all kernels: $(join_by_space "${desired_args[@]}")"
     grubby --update-kernel=ALL --args="$(join_by_space "${desired_args[@]}")"
   fi
 }
@@ -425,10 +347,6 @@ apply_boot_args() {
   else
     apply_boot_args_legacy "$@"
   fi
-}
-
-remove_boot_args() {
-  apply_boot_args
 }
 
 get_default_kernel_args() {
@@ -488,21 +406,43 @@ show_arg_state() {
   done
 }
 
+enable() {
+  need_root
+
+  write_sysctl_file
+  apply_boot_args "${KSPP_ARGS[@]}"
+
+  ok "KSPP server-safe hardening enabled."
+  warn "Boot parameters require reboot before they appear in /proc/cmdline."
+  log "After reboot, run: $0 status"
+}
+
+disable() {
+  need_root
+
+  if [[ -f "$SYSCTL_FILE" ]]; then
+    rm -f "$SYSCTL_FILE"
+    ok "Removed $SYSCTL_FILE"
+  else
+    log "$SYSCTL_FILE already absent"
+  fi
+
+  apply_boot_args
+
+  ok "Removed managed KSPP boot args."
+  warn "Runtime sysctl values may remain until reboot or until overridden by another sysctl file."
+  warn "Boot parameter removal also requires reboot."
+}
+
 status() {
-  local detected_profile
-  detected_profile="$(detect_profile)"
+  local current_cmdline next_args klog failed=0
+  current_cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
+  next_args="$(get_default_kernel_args)"
+  klog="$(get_kernel_log)"
 
-  local args_var
-  args_var="$(profile_args_var "$detected_profile")"
-  local -n target_args="$args_var"
-
-  echo "===== KSPP STATUS ====="
+  echo "===== KSPP STATUS + VERIFY ====="
   echo
 
-  echo "[Detected profile]"
-  echo "$detected_profile"
-
-  echo
   echo "[Boot mode]"
   if is_bls; then
     echo "BLS / grubby"
@@ -512,12 +452,10 @@ status() {
 
   echo
   echo "[Current running kernel cmdline]"
-  cat /proc/cmdline
+  echo "$current_cmdline"
 
   echo
   echo "[Configured default kernel cmdline - next boot]"
-  local next_args
-  next_args="$(get_default_kernel_args)"
   echo "$next_args"
 
   echo
@@ -539,62 +477,35 @@ status() {
     fi
   done
 
-  show_arg_state "$(cat /proc/cmdline)" "${detected_profile} boot args in current running kernel" "${target_args[@]}"
-  show_arg_state "$next_args" "${detected_profile} boot args configured for next boot" "${target_args[@]}"
-
   echo
-  echo "======================="
-}
+  echo "[Expected runtime sysctl verification]"
+  local line expected actual
+  for line in "${KSPP_SYSCTL[@]}"; do
+    key="${line%%=*}"
+    expected="${line#*=}"
 
-verify() {
-  local profile
-  profile="$(resolve_profile "$PROFILE_ARG")"
+    if sysctl_exists "$key"; then
+      actual="$(sysctl -n "$key" 2>/dev/null || true)"
 
-  local args_var sysctl_var
-  args_var="$(profile_args_var "$profile")"
-  sysctl_var="$(profile_sysctl_var "$profile")"
+      if [[ "$actual" == "$expected" ]]; then
+        echo "OK        $key=$actual"
+      else
+        echo "WARN      $key expected $expected, found $actual"
+        failed=1
+      fi
+    else
+      echo "SKIP      $key is missing on this kernel"
+    fi
+  done
 
-  local -n target_args="$args_var"
-  local -n target_sysctl="$sysctl_var"
-
-  echo "===== KSPP VERIFY ====="
-  echo
-
-  local cmdline
-  cmdline="$(cat /proc/cmdline)"
-
-  local klog
-  klog="$(journalctl -k -b -o cat 2>/dev/null || dmesg 2>/dev/null || true)"
-
-  local cfg="/boot/config-$(uname -r)"
-  local failed=0
-
-  echo "[Selected profile]"
-  echo "$profile"
-  echo
-
-  echo "[Kernel]"
-  uname -r
-  echo
-
-  echo "[Passed on current cmdline]"
-  if [[ "${#target_args[@]}" -eq 0 ]]; then
-    echo "(none expected)"
-  else
-    local arg
-    for arg in "${target_args[@]}"; do
-      print_arg_state "$cmdline" "$arg" || failed=1
-    done
-  fi
+  show_arg_state "$current_cmdline" "KSPP boot args in current running kernel" "${KSPP_ARGS[@]}"
+  show_arg_state "$next_args" "KSPP boot args configured for next boot" "${KSPP_ARGS[@]}"
 
   echo
   echo "[Kernel boot warnings about managed args]"
-
-  local unknown_lines
+  local unknown_lines matched_unknown="" managed
   unknown_lines="$(echo "$klog" | grep -Ei 'Unknown kernel command line parameters|unknown parameter|invalid.*parameter|Malformed early option' || true)"
 
-  local matched_unknown=""
-  local managed
   for managed in "${MANAGED_ARG_KEYS[@]}"; do
     if echo "$unknown_lines" | grep -Fq "$managed"; then
       matched_unknown+="$(echo "$unknown_lines" | grep -F "$managed")"$'\n'
@@ -611,19 +522,18 @@ verify() {
   echo
   echo "[Copy Fail / algif_aead mitigation]"
 
-  if array_has_key "initcall_blacklist" "${target_args[@]}"; then
-    if echo "$cmdline" | tr ' ' '\n' | grep -qx 'initcall_blacklist=algif_aead_init'; then
-      echo "OK        initcall_blacklist=algif_aead_init is present in current cmdline"
-    else
-      echo "WARN      initcall_blacklist=algif_aead_init is not active in current cmdline"
-      echo "          Reboot is required after applying the profile."
-      failed=1
-    fi
+  if echo "$current_cmdline" | tr ' ' '\n' | grep -qx 'initcall_blacklist=algif_aead_init'; then
+    echo "OK        initcall_blacklist=algif_aead_init is present in current cmdline"
+  else
+    echo "WARN      initcall_blacklist=algif_aead_init is not active in current cmdline"
+    echo "          Reboot is required after enable."
+    failed=1
+  fi
 
-    if has_cmd python3; then
-      local afalg_test
-      afalg_test="$(
-        python3 - <<'PY' 2>&1
+  if has_cmd python3; then
+    local afalg_test
+    afalg_test="$(
+      python3 - <<'PY' 2>&1
 import socket
 
 AF_ALG = getattr(socket, "AF_ALG", 38)
@@ -635,263 +545,135 @@ try:
 except OSError as e:
     print("OK: AF_ALG AEAD bind failed:", e)
 PY
-      )"
+    )"
 
-      echo "$afalg_test"
+    echo "$afalg_test"
 
-      if echo "$afalg_test" | grep -q '^WARN:'; then
-        failed=1
-      fi
-    else
-      echo "SKIP      python3 not found, cannot test AF_ALG AEAD bind"
+    if echo "$afalg_test" | grep -q '^WARN:'; then
+      failed=1
     fi
   else
-    echo "SKIP      initcall_blacklist=algif_aead_init is not part of selected profile"
-  fi
-
-  echo
-  echo "[Runtime sysctl values for selected profile]"
-
-  if [[ "${#target_sysctl[@]}" -eq 0 ]]; then
-    echo "(none expected)"
-  else
-    local line key expected actual
-    for line in "${target_sysctl[@]}"; do
-      key="${line%%=*}"
-      expected="${line#*=}"
-
-      if sysctl_exists "$key"; then
-        actual="$(sysctl -n "$key" 2>/dev/null || true)"
-
-        if [[ "$actual" == "$expected" ]]; then
-          echo "OK        $key=$actual"
-        else
-          echo "WARN      $key expected $expected, found $actual"
-          failed=1
-        fi
-      else
-        echo "SKIP      $key is missing on this kernel"
-      fi
-    done
+    echo "SKIP      python3 not found, cannot test AF_ALG AEAD bind"
   fi
 
   echo
   echo "[page_alloc.shuffle runtime state]"
-  if array_has_key "page_alloc.shuffle" "${target_args[@]}"; then
-    if [[ -r /sys/module/page_alloc/parameters/shuffle ]]; then
-      local shuffle
-      shuffle="$(cat /sys/module/page_alloc/parameters/shuffle)"
+  if [[ -r /sys/module/page_alloc/parameters/shuffle ]]; then
+    local shuffle
+    shuffle="$(cat /sys/module/page_alloc/parameters/shuffle)"
 
-      case "$shuffle" in
-        1|Y|y|on|true)
-          echo "OK        /sys/module/page_alloc/parameters/shuffle = $shuffle"
-          ;;
-        *)
-          echo "WARN      /sys/module/page_alloc/parameters/shuffle = $shuffle"
-          failed=1
-          ;;
-      esac
-    else
-      echo "WARN      /sys/module/page_alloc/parameters/shuffle not found"
-      echo "          Kernel may lack CONFIG_SHUFFLE_PAGE_ALLOCATOR=y"
-      failed=1
-    fi
+    case "$shuffle" in
+      1|Y|y|on|true)
+        echo "OK        /sys/module/page_alloc/parameters/shuffle = $shuffle"
+        ;;
+      *)
+        echo "WARN      /sys/module/page_alloc/parameters/shuffle = $shuffle"
+        failed=1
+        ;;
+    esac
   else
-    echo "SKIP      page_alloc.shuffle is not part of selected profile"
+    echo "WARN      /sys/module/page_alloc/parameters/shuffle not found"
+    echo "          Kernel may lack CONFIG_SHUFFLE_PAGE_ALLOCATOR=y"
+    failed=1
   fi
 
   echo
   echo "[mem auto-init state]"
-  if array_has_key "init_on_alloc" "${target_args[@]}" || array_has_key "init_on_free" "${target_args[@]}"; then
-    local meminit_state meminit_clear
-    meminit_state="$(echo "$klog" | grep -i 'mem auto-init:.*heap alloc:' | tail -n1 || true)"
-    meminit_clear="$(echo "$klog" | grep -i 'mem auto-init: clearing system memory may take some time' | tail -n1 || true)"
+  local meminit_state
+  meminit_state="$(echo "$klog" | grep -i 'mem auto-init:.*heap alloc:' | tail -n1 || true)"
 
-    if [[ -n "$meminit_state" ]]; then
-      echo "$meminit_state"
+  if [[ -n "$meminit_state" ]]; then
+    echo "$meminit_state"
 
-      if echo "$meminit_state" | grep -q 'heap alloc:on'; then
-        echo "OK        init_on_alloc appears active"
-      else
-        echo "WARN      init_on_alloc does not appear active in mem auto-init log"
-        failed=1
-      fi
-
-      if echo "$meminit_state" | grep -q 'heap free:on'; then
-        echo "OK        init_on_free appears active"
-      else
-        echo "WARN      init_on_free does not appear active in mem auto-init log"
-        failed=1
-      fi
-
-      if [[ -n "$meminit_clear" ]]; then
-        echo "OK        kernel printed memory-clearing notice"
-      fi
+    if echo "$meminit_state" | grep -q 'heap alloc:on'; then
+      echo "OK        init_on_alloc appears active"
     else
-      if [[ -n "$meminit_clear" ]]; then
-        echo "$meminit_clear"
-        echo "PARTIAL   memory-clearing notice found; this normally indicates init_on_free is active"
-        echo "WARN      state line with heap alloc/free was not found, so init_on_alloc cannot be confirmed from log"
-      else
-        echo "WARN      no detailed mem auto-init line found in kernel log"
-        echo "          Try: journalctl -k -b -o cat | grep -i 'mem auto-init'"
-        failed=1
-      fi
+      echo "WARN      init_on_alloc does not appear active in mem auto-init log"
+      failed=1
     fi
   else
-    echo "SKIP      init_on_alloc/init_on_free are not part of selected profile"
+    echo "WARN      no detailed mem auto-init line found in kernel log"
+    echo "          Try: journalctl -k -b -o cat | grep -i 'mem auto-init'"
+    failed=1
   fi
 
   echo
   echo "[randomize_kstack_offset support]"
-  if array_has_key "randomize_kstack_offset" "${target_args[@]}"; then
-    if [[ -r "$cfg" ]]; then
-      if grep -q '^CONFIG_HAVE_ARCH_RANDOMIZE_KSTACK_OFFSET=y' "$cfg" && \
-         grep -q '^CONFIG_RANDOMIZE_KSTACK_OFFSET=y' "$cfg"; then
-        echo "OK        kernel config supports randomize_kstack_offset"
-      else
-        echo "WARN      kernel config may not support randomize_kstack_offset"
-        failed=1
-      fi
+  if read_kernel_config >/tmp/kspp.kernel.config.$$ 2>/dev/null; then
+    if grep -q '^CONFIG_HAVE_ARCH_RANDOMIZE_KSTACK_OFFSET=y' /tmp/kspp.kernel.config.$$ && \
+       grep -q '^CONFIG_RANDOMIZE_KSTACK_OFFSET=y' /tmp/kspp.kernel.config.$$; then
+      echo "OK        kernel config supports randomize_kstack_offset"
     else
-      echo "WARN      $cfg not readable"
+      echo "WARN      kernel config may not support randomize_kstack_offset"
       failed=1
     fi
-  else
-    echo "SKIP      randomize_kstack_offset is not part of selected profile"
-  fi
 
-  echo
-  echo "[debugfs state]"
-  if array_has_key "debugfs" "${target_args[@]}"; then
-    if grep -qw debugfs /proc/mounts; then
-      echo "WARN      debugfs appears mounted:"
-      grep -w debugfs /proc/mounts || true
-      failed=1
-    else
-      echo "OK        debugfs is not mounted"
-    fi
+    echo
+    echo "[Kernel config hints]"
+    grep -E 'CONFIG_SHUFFLE_PAGE_ALLOCATOR|CONFIG_INIT_ON_ALLOC|CONFIG_HAVE_ARCH_RANDOMIZE_KSTACK_OFFSET|CONFIG_RANDOMIZE_KSTACK_OFFSET|CONFIG_SLUB|CONFIG_BPF_JIT|CONFIG_CRYPTO_USER_API|CONFIG_CRYPTO_USER_API_AEAD' /tmp/kspp.kernel.config.$$ || true
+    rm -f /tmp/kspp.kernel.config.$$
   else
-    echo "SKIP      debugfs=off is not part of selected profile"
-  fi
-
-  echo
-  echo "[vsyscall state]"
-  if array_has_key "vsyscall" "${target_args[@]}"; then
-    if grep -q '\[vsyscall\]' /proc/self/maps 2>/dev/null; then
-      echo "WARN      [vsyscall] mapping is visible in /proc/self/maps"
-      failed=1
-    else
-      echo "OK        no [vsyscall] mapping visible"
-    fi
-  else
-    echo "SKIP      vsyscall=none is not part of selected profile"
-  fi
-
-  echo
-  echo "[Kernel config hints]"
-  if [[ -r "$cfg" ]]; then
-    grep -E 'CONFIG_SHUFFLE_PAGE_ALLOCATOR|CONFIG_INIT_ON_ALLOC|CONFIG_INIT_ON_FREE|CONFIG_HAVE_ARCH_RANDOMIZE_KSTACK_OFFSET|CONFIG_RANDOMIZE_KSTACK_OFFSET|CONFIG_SLUB|CONFIG_DEBUG_FS|CONFIG_IO_URING|CONFIG_BPF_JIT|CONFIG_LEGACY_VSYSCALL|CONFIG_CRYPTO_USER_API|CONFIG_CRYPTO_USER_API_AEAD' "$cfg" || true
-  else
-    echo "WARN      $cfg not readable"
+    echo "WARN      kernel config not readable from /boot/config-$(uname -r) or /proc/config.gz"
+    failed=1
   fi
 
   echo
   echo "[Interpretation]"
-  echo "OK in /proc/cmdline means the bootloader passed it."
+  echo "OK in current cmdline means the bootloader passed the arg for this boot."
+  echo "OK in next-boot cmdline means it should persist after future reboots."
   echo "No unknown/invalid kernel warning means the kernel probably accepted it."
   echo "Some early/static params do not expose a runtime boolean."
-  echo "For Copy Fail mitigation, AF_ALG AEAD bind should fail after reboot."
 
   echo
   if [[ "$failed" -eq 0 ]]; then
-    echo "[+] Verification looks good."
+    echo "[+] Status verification looks good."
   else
-    echo "[!] Verification found warnings. Review output above."
+    echo "[!] Status verification found warnings. Review output above."
   fi
 
-  echo "======================="
+  echo "=============================="
 }
 
 usage() {
   cat <<EOF
-Usage: $0 {none|safe|strict|status|verify|help} [safe|strict|none|auto]
+Usage: $0 {enable|disable|status|help}
 
 Modes:
-  safe      Apply low-risk KSPP profile
-  strict    Apply stronger KSPP profile
-  none      Remove kspp.sh persistent sysctl file and managed boot args
-  status    Show current runtime and next-boot state
-  verify    Verify whether current boot appears to have accepted selected profile
+  enable   Apply server-safe KSPP hardening
+  disable  Remove managed KSPP settings
+  status   Show status and verification
+  help     Show this help
 
-Examples:
-  $0 safe
-  $0 strict
-  $0 status
-  $0 verify
-  $0 verify safe
-  $0 verify strict
-  $0 none
+Server-safe profile includes:
+  Sysctl:
+    kptr_restrict, dmesg_restrict, unprivileged_bpf_disabled,
+    randomize_va_space, protected hardlinks/symlinks/fifos/regular,
+    bpf_jit_harden, perf_event_paranoid=3, yama.ptrace_scope=1
+
+  Boot args:
+    slab_nomerge
+    init_on_alloc=1
+    page_alloc.shuffle=1
+    randomize_kstack_offset=on
+    initcall_blacklist=algif_aead_init
+
+Intentionally excluded for compatibility:
+  kernel.io_uring_disabled=1
+  debugfs=off
+  vsyscall=none
+  init_on_free=1
 
 Important:
   Boot args require reboot before appearing in /proc/cmdline.
-
-Temporary Copy Fail mitigation:
-  Both safe and strict currently include:
-    initcall_blacklist=algif_aead_init
-
-  Remove this later once all relevant kernels are patched.
 EOF
 }
 
-apply_safe() {
-  need_root
-  write_sysctl_file SAFE_SYSCTL
-  apply_boot_args "${SAFE_ARGS[@]}"
-
-  ok "Safe profile applied."
-  warn "Boot parameters require reboot before they appear in /proc/cmdline."
-  log "After reboot, run: $0 verify safe"
-}
-
-apply_strict() {
-  need_root
-  write_sysctl_file STRICT_SYSCTL
-  apply_boot_args "${STRICT_ARGS[@]}"
-
-  ok "Strict profile applied."
-  warn "Boot parameters require reboot before they appear in /proc/cmdline."
-  log "After reboot, run: $0 verify strict"
-}
-
-apply_none() {
-  need_root
-
-  if [[ -f "$SYSCTL_FILE" ]]; then
-    rm -f "$SYSCTL_FILE"
-    ok "Removed $SYSCTL_FILE"
-  else
-    log "$SYSCTL_FILE already absent"
-  fi
-
-  remove_boot_args
-
-  ok "Removed managed KSPP boot args."
-  warn "Runtime sysctl values may remain until reboot or until overridden by another sysctl file."
-}
-
 case "$MODE" in
-  safe)
-    apply_safe
+  enable)
+    enable
     ;;
-  strict)
-    apply_strict
-    ;;
-  verify)
-    verify
-    ;;
-  none)
-    apply_none
+  disable)
+    disable
     ;;
   status|"")
     status
