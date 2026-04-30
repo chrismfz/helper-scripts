@@ -337,18 +337,47 @@ remove_managed_args_from_line() {
 }
 
 update_grub_cfg() {
-  if [[ -d /sys/firmware/efi ]]; then
-    local cfg
+  # Debian/Ubuntu wrapper. Usually runs:
+  #   grub-mkconfig -o /boot/grub/grub.cfg
+  if has_cmd update-grub; then
+    log "Regenerating GRUB config using update-grub"
+    update-grub >/dev/null
+    return
+  fi
+
+  local mkconfig=""
+
+  if has_cmd grub2-mkconfig; then
+    mkconfig="grub2-mkconfig"
+  elif has_cmd grub-mkconfig; then
+    mkconfig="grub-mkconfig"
+  else
+    die "Could not find update-grub, grub2-mkconfig, or grub-mkconfig"
+  fi
+
+  local cfg=""
+
+  # RHEL/Alma/Rocky legacy location
+  if [[ -f /boot/grub2/grub.cfg || -d /boot/grub2 ]]; then
+    cfg="/boot/grub2/grub.cfg"
+
+  # Debian/Ubuntu location
+  elif [[ -f /boot/grub/grub.cfg || -d /boot/grub ]]; then
+    cfg="/boot/grub/grub.cfg"
+
+  # Last-resort EFI vendor grub.cfg detection
+  elif [[ -d /sys/firmware/efi ]]; then
     cfg="$(find /boot/efi/EFI -name grub.cfg 2>/dev/null | head -n1 || true)"
     [[ -n "$cfg" ]] || die "Could not find EFI grub.cfg"
 
-    log "Regenerating GRUB config: $cfg"
-    grub2-mkconfig -o "$cfg" >/dev/null
   else
-    log "Regenerating GRUB config: /boot/grub2/grub.cfg"
-    grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null
+    die "Could not determine GRUB config output path"
   fi
+
+  log "Regenerating GRUB config using $mkconfig: $cfg"
+  "$mkconfig" -o "$cfg" >/dev/null
 }
+
 
 apply_boot_args_bls() {
   local -a desired_args=("$@")
