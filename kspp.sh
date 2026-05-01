@@ -163,7 +163,25 @@ is_proxmox_boot_tool() {
 }
 
 is_bls() {
-  [[ -d /boot/loader/entries ]] && has_cmd grubby
+  [[ -d /boot/loader/entries ]] || return 1
+  has_cmd grubby || return 1
+
+  # If explicitly disabled, do not use BLS even if entries exist.
+  if [[ -f /etc/default/grub ]] && grep -qE '^GRUB_ENABLE_BLSCFG="?false"?' /etc/default/grub; then
+    return 1
+  fi
+
+  # Strong evidence active GRUB config loads BLS.
+  if grep -Rqs 'blscfg' /boot/grub2/grub.cfg /boot/grub/grub.cfg /boot/efi/EFI/*/grub.cfg 2>/dev/null; then
+    return 0
+  fi
+
+  # Fallback only if explicitly enabled.
+  if [[ -f /etc/default/grub ]] && grep -qE '^GRUB_ENABLE_BLSCFG="?true"?' /etc/default/grub; then
+    return 0
+  fi
+
+  return 1
 }
 
 boot_backend() {
