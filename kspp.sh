@@ -2,9 +2,10 @@
 # ============================================================
 # KSPP Server-Safe Hardening Script
 # ------------------------------------------------------------
-# Cross-distro:
-#   - RHEL/Alma/Rocky BLS/grubby
-#   - Debian/Ubuntu update-grub / grub-mkconfig
+# Cross-distro boot support:
+#   - Proxmox systemd-boot / proxmox-boot-tool
+#   - RHEL/Alma/Rocky BLS / grubby
+#   - Debian/Ubuntu/RHEL legacy GRUB
 #
 # Simple modes:
 #   enable   Apply server-safe hardening
@@ -24,8 +25,12 @@ set -Eeuo pipefail
 MODE="${1:-status}"
 
 SYSCTL_FILE="/etc/sysctl.d/99-kspp.conf"
+
 GRUB_FILE="/etc/default/grub"
 GRUB_BACKUP="/etc/default/grub.kspp.bak"
+
+PVE_CMDLINE_FILE="/etc/kernel/cmdline"
+PVE_CMDLINE_BACKUP="/etc/kernel/cmdline.kspp.bak"
 
 # ------------------------------------------------------------
 # Server-safe sysctl profile
@@ -48,7 +53,6 @@ KSPP_SYSCTL=(
   "kernel.perf_event_paranoid=3"
 
   # Keep this at 1 for compatibility/debuggability.
-  # 2 is stricter but can make support/debug workflows harder.
   "kernel.yama.ptrace_scope=1"
 )
 
@@ -122,10 +126,6 @@ has_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
-is_bls() {
-  [[ -d /boot/loader/entries ]] && has_cmd grubby
-}
-
 join_by_space() {
   local IFS=' '
   echo "$*"
@@ -141,18 +141,52 @@ sysctl_exists() {
   [[ -e "$(sysctl_proc_path "$key")" ]]
 }
 
-array_has_key() {
-  local needle="$1"
-  shift
+# ------------------------------------------------------------
+# Boot backend detection
+# ------------------------------------------------------------
 
-  local item key
-  for item in "$@"; do
-    key="${item%%=*}"
-    [[ "$key" == "$needle" ]] && return 0
-  done
+is_proxmox_boot_tool() {
+  has_cmd proxmox-boot-tool || return 1
+  [[ -f "$PVE_CMDLINE_FILE" ]] || return 1
+
+  # Strong indication: currently booted with Proxmox EFI/systemd-boot entries.
+  if grep -qE '(^| )initrd=\\EFI\\proxmox\\' /proc/cmdline 2>/dev/null; then
+    return 0
+  fi
+
+  # Also accept proxmox-boot-tool systems with configured ESPs.
+  if proxmox-boot-tool status 2>/dev/null | grep -qiE 'configured|esp|proxmox|systemd-boot'; then
+    return 0
+  fi
 
   return 1
 }
+
+is_bls() {
+  [[ -d /boot/loader/entries ]] && has_cmd grubby
+}
+
+boot_backend() {
+  if is_proxmox_boot_tool; then
+    echo "proxmox"
+  elif is_bls; then
+    echo "bls"
+  else
+    echo "grub"
+  fi
+}
+
+boot_backend_label() {
+  case "$(boot_backend)" in
+    proxmox) echo "Proxmox boot tool / systemd-boot" ;;
+    bls)     echo "BLS / grubby" ;;
+    grub)    echo "Legacy GRUB" ;;
+  esac
+}
+
+# ------------------------------------------------------------
+# General helpers
+# ------------------------------------------------------------
 
 get_kernel_log() {
   journalctl -k -b -o cat 2>/dev/null || dmesg 2>/dev/null || true
@@ -213,6 +247,32 @@ write_sysctl_file() {
   apply_sysctl_file
 }
 
+remove_managed_args_from_line() {
+  local line="$1"
+  local out=()
+  local word key remove managed
+
+  for word in $line; do
+    key="${word%%=*}"
+    remove=0
+
+    for managed in "${MANAGED_ARG_KEYS[@]}"; do
+      if [[ "$key" == "$managed" ]]; then
+        remove=1
+        break
+      fi
+    done
+
+    [[ "$remove" -eq 0 ]] && out+=("$word")
+  done
+
+  echo "${out[*]:-}"
+}
+
+# ------------------------------------------------------------
+# GRUB helpers
+# ------------------------------------------------------------
+
 backup_grub() {
   if [[ -f "$GRUB_FILE" && ! -f "$GRUB_BACKUP" ]]; then
     cp -a "$GRUB_FILE" "$GRUB_BACKUP"
@@ -242,28 +302,6 @@ set_grub_cmdline() {
   else
     echo "GRUB_CMDLINE_LINUX=\"${new_cmdline}\"" >> "$GRUB_FILE"
   fi
-}
-
-remove_managed_args_from_line() {
-  local line="$1"
-  local out=()
-  local word key remove managed
-
-  for word in $line; do
-    key="${word%%=*}"
-    remove=0
-
-    for managed in "${MANAGED_ARG_KEYS[@]}"; do
-      if [[ "$key" == "$managed" ]]; then
-        remove=1
-        break
-      fi
-    done
-
-    [[ "$remove" -eq 0 ]] && out+=("$word")
-  done
-
-  echo "${out[*]:-}"
 }
 
 update_grub_cfg() {
@@ -301,6 +339,39 @@ update_grub_cfg() {
   "$mkconfig" -o "$cfg" >/dev/null
 }
 
+# ------------------------------------------------------------
+# Boot arg application backends
+# ------------------------------------------------------------
+
+apply_boot_args_proxmox() {
+  local -a desired_args=("$@")
+
+  [[ -f "$PVE_CMDLINE_FILE" ]] || die "$PVE_CMDLINE_FILE not found"
+  has_cmd proxmox-boot-tool || die "proxmox-boot-tool not found"
+
+  if [[ ! -f "$PVE_CMDLINE_BACKUP" ]]; then
+    cp -a "$PVE_CMDLINE_FILE" "$PVE_CMDLINE_BACKUP"
+    ok "Created backup: $PVE_CMDLINE_BACKUP"
+  fi
+
+  local current cleaned new_cmdline
+
+  current="$(cat "$PVE_CMDLINE_FILE")"
+  cleaned="$(remove_managed_args_from_line "$current")"
+
+  if [[ "${#desired_args[@]}" -gt 0 ]]; then
+    new_cmdline="$(echo "$cleaned $(join_by_space "${desired_args[@]}")" | xargs)"
+  else
+    new_cmdline="$(echo "$cleaned" | xargs)"
+  fi
+
+  log "Updating $PVE_CMDLINE_FILE"
+  echo "$new_cmdline" > "$PVE_CMDLINE_FILE"
+
+  log "Refreshing Proxmox boot entries"
+  proxmox-boot-tool refresh
+}
+
 apply_boot_args_bls() {
   local -a desired_args=("$@")
   local -a remove_args=()
@@ -319,7 +390,7 @@ apply_boot_args_bls() {
   fi
 }
 
-apply_boot_args_legacy() {
+apply_boot_args_grub() {
   local -a desired_args=("$@")
 
   [[ -f "$GRUB_FILE" ]] || die "$GRUB_FILE not found"
@@ -342,23 +413,37 @@ apply_boot_args_legacy() {
 }
 
 apply_boot_args() {
-  if is_bls; then
-    apply_boot_args_bls "$@"
-  else
-    apply_boot_args_legacy "$@"
-  fi
+  case "$(boot_backend)" in
+    proxmox)
+      apply_boot_args_proxmox "$@"
+      ;;
+    bls)
+      apply_boot_args_bls "$@"
+      ;;
+    grub)
+      apply_boot_args_grub "$@"
+      ;;
+  esac
 }
 
 get_default_kernel_args() {
-  if is_bls; then
-    grubby --info=DEFAULT 2>/dev/null \
-      | sed -n 's/^args=//p' \
-      | sed -E 's/^"//; s/"$//'
-  elif [[ -f "$GRUB_FILE" ]]; then
-    get_grub_cmdline
-  else
-    echo "(unknown)"
-  fi
+  case "$(boot_backend)" in
+    proxmox)
+      cat "$PVE_CMDLINE_FILE" 2>/dev/null || echo "(unknown)"
+      ;;
+    bls)
+      grubby --info=DEFAULT 2>/dev/null \
+        | sed -n 's/^args=//p' \
+        | sed -E 's/^"//; s/"$//'
+      ;;
+    grub)
+      if [[ -f "$GRUB_FILE" ]]; then
+        get_grub_cmdline
+      else
+        echo "(unknown)"
+      fi
+      ;;
+  esac
 }
 
 print_arg_state() {
@@ -444,11 +529,7 @@ status() {
   echo
 
   echo "[Boot mode]"
-  if is_bls; then
-    echo "BLS / grubby"
-  else
-    echo "Legacy GRUB"
-  fi
+  boot_backend_label
 
   echo
   echo "[Current running kernel cmdline]"
@@ -599,9 +680,12 @@ PY
 
   echo
   echo "[randomize_kstack_offset support]"
-  if read_kernel_config >/tmp/kspp.kernel.config.$$ 2>/dev/null; then
-    if grep -q '^CONFIG_HAVE_ARCH_RANDOMIZE_KSTACK_OFFSET=y' /tmp/kspp.kernel.config.$$ && \
-       grep -q '^CONFIG_RANDOMIZE_KSTACK_OFFSET=y' /tmp/kspp.kernel.config.$$; then
+  local cfg_tmp
+  cfg_tmp="$(mktemp /tmp/kspp.kernel.config.XXXXXX)"
+
+  if read_kernel_config >"$cfg_tmp" 2>/dev/null; then
+    if grep -q '^CONFIG_HAVE_ARCH_RANDOMIZE_KSTACK_OFFSET=y' "$cfg_tmp" && \
+       grep -q '^CONFIG_RANDOMIZE_KSTACK_OFFSET=y' "$cfg_tmp"; then
       echo "OK        kernel config supports randomize_kstack_offset"
     else
       echo "WARN      kernel config may not support randomize_kstack_offset"
@@ -610,12 +694,13 @@ PY
 
     echo
     echo "[Kernel config hints]"
-    grep -E 'CONFIG_SHUFFLE_PAGE_ALLOCATOR|CONFIG_INIT_ON_ALLOC|CONFIG_HAVE_ARCH_RANDOMIZE_KSTACK_OFFSET|CONFIG_RANDOMIZE_KSTACK_OFFSET|CONFIG_SLUB|CONFIG_BPF_JIT|CONFIG_CRYPTO_USER_API|CONFIG_CRYPTO_USER_API_AEAD' /tmp/kspp.kernel.config.$$ || true
-    rm -f /tmp/kspp.kernel.config.$$
+    grep -E 'CONFIG_SHUFFLE_PAGE_ALLOCATOR|CONFIG_INIT_ON_ALLOC|CONFIG_HAVE_ARCH_RANDOMIZE_KSTACK_OFFSET|CONFIG_RANDOMIZE_KSTACK_OFFSET|CONFIG_SLUB|CONFIG_BPF_JIT|CONFIG_CRYPTO_USER_API|CONFIG_CRYPTO_USER_API_AEAD' "$cfg_tmp" || true
   else
     echo "WARN      kernel config not readable from /boot/config-$(uname -r) or /proc/config.gz"
     failed=1
   fi
+
+  rm -f "$cfg_tmp"
 
   echo
   echo "[Interpretation]"
@@ -662,6 +747,11 @@ Intentionally excluded for compatibility:
   debugfs=off
   vsyscall=none
   init_on_free=1
+
+Boot backend support:
+  Proxmox boot tool / systemd-boot
+  BLS / grubby
+  Legacy GRUB / update-grub / grub-mkconfig
 
 Important:
   Boot args require reboot before appearing in /proc/cmdline.
